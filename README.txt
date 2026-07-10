@@ -1,6 +1,8 @@
 {
   "build": {
-    "builder": "DOCKERFILE",
-    "dockerfilePath": "Dockerfile"
+    "builder": "nixpacks"
+  },
+  "deploy": {
+    "startCommand": "PYTHONPATH=/app python main.py"
   }
 }
