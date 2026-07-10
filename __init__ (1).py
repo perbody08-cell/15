@@ -1,59 +1,175 @@
-import os
-from typing import Any
-from pydantic import field_validator
-from pydantic_settings import BaseSettings
+from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey, JSON, BigInteger, Float
+from sqlalchemy.ext.asyncio import AsyncAttrs
+from sqlalchemy.orm import declarative_base, relationship
+from datetime import datetime
+
+Base = declarative_base()
 
 
-class Settings(BaseSettings):
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/bot")
+class User(Base):
+    __tablename__ = "users"
 
-    def _normalize_database_url(self, url: str) -> str:
-        """Приводит Railway URL к формату, понятному SQLAlchemy + asyncpg."""
-        url = url.strip()
-        # Railway иногда даёт postgres:// вместо postgresql://
-        if url.startswith("postgres://"):
-            url = "postgresql" + url[len("postgres"):]
-        # Если asyncpg ещё не указан, добавляем его
-        if url.startswith("postgresql://") and "+asyncpg" not in url:
-            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-        return url
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    username = Column(String(100))
+    first_name = Column(String(100))
+    last_name = Column(String(100))
+
+    # Business Mode
+    business_connection_id = Column(String(255), unique=True)
+    is_business_connected = Column(Boolean, default=False)
+
+    # Direct Mode (общение с ботом)
+    direct_mode_enabled = Column(Boolean, default=True)
+    direct_persona = Column(Text)  # Персона для прямого общения
+
+    # Настройки
+    chosen_prompt_id = Column(Integer, ForeignKey("prompts.id"), default=1)
+    custom_prompt = Column(Text)
+    global_knowledge = Column(JSON, default=dict)
 
     # LLM
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "mock")
-    LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "claude-sonnet-4.6")
-    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "")
+    llm_provider = Column(String(50), default="mock")
+    llm_api_key = Column(String(500))
 
-    # Modes
-    ENABLE_BUSINESS_MODE: bool = os.getenv("ENABLE_BUSINESS_MODE", "true").lower() == "true"
-    ENABLE_DIRECT_MODE: bool = os.getenv("ENABLE_DIRECT_MODE", "true").lower() == "true"
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    # Settings
-    MAX_CONTEXT_MESSAGES: int = int(os.getenv("MAX_CONTEXT_MESSAGES", "20"))
-    DEFAULT_PROMPT_ID: int = int(os.getenv("DEFAULT_PROMPT_ID", "1"))
-
-    # Admin — храним как строку, чтобы Pydantic не ругался на тип из Railway.
-    # Парсим в список int через свойство get_admin_ids().
-    ADMIN_IDS: str = ""
-
-    @property
-    def get_admin_ids(self) -> list[int]:
-        """Возвращает ADMIN_IDS как список int."""
-        if not self.ADMIN_IDS:
-            return []
-        try:
-            return [int(x.strip()) for x in str(self.ADMIN_IDS).split(",") if x.strip()]
-        except ValueError:
-            return []
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Приводим DATABASE_URL к формату asyncpg (важно для Railway)
-        self.DATABASE_URL = self._normalize_database_url(self.DATABASE_URL)
-
-    class Config:
-        env_file = ".env"
+    contacts = relationship("Contact", back_populates="owner", lazy="selectin")
+    chat_sessions = relationship("ChatSession", back_populates="owner", lazy="selectin")
+    direct_chats = relationship("DirectChat", back_populates="user", lazy="selectin")
+    prompt = relationship("Prompt", lazy="selectin")
 
 
-settings = Settings()
+class Contact(Base):
+    __tablename__ = "contacts"
+
+    id = Column(Integer, primary_key=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    telegram_user_id = Column(BigInteger)
+    username = Column(String(100))
+    first_name = Column(String(100))
+    last_name = Column(String(100))
+    phone = Column(String(50))
+
+    relationship_type = Column(String(50), default="unknown")
+    notes = Column(Text)
+    extracted_style = Column(JSON, default=dict)
+
+    is_active = Column(Boolean, default=True)
+    use_custom_prompt = Column(Boolean, default=False)
+    custom_prompt = Column(Text)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    owner = relationship("User", back_populates="contacts")
+    messages = relationship("Message", back_populates="contact", lazy="selectin")
+
+
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+
+    id = Column(Integer, primary_key=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    contact_id = Column(Integer, ForeignKey("contacts.id"))
+    chat_id = Column(BigInteger, nullable=False)
+
+    session_type = Column(String(20), default="business")  # business, direct
+    is_active = Column(Boolean, default=True)
+    last_message_at = Column(DateTime)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    owner = relationship("User", back_populates="chat_sessions")
+    messages = relationship("Message", back_populates="session", lazy="selectin")
+
+
+class DirectChat(Base):
+    """Прямое общение пользователя с ботом (не Business)"""
+    __tablename__ = "direct_chats"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # Настройки персоны для этого чата
+    persona_name = Column(String(100), default="Помощник")
+    persona_description = Column(Text)
+    system_prompt = Column(Text)
+
+    # Контекст
+    context_summary = Column(Text)  # Сводка предыдущих разговоров
+
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", back_populates="direct_chats")
+    messages = relationship("DirectMessage", back_populates="chat", lazy="selectin")
+
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id"), nullable=False)
+    contact_id = Column(Integer, ForeignKey("contacts.id"))
+
+    sender_type = Column(String(20), nullable=False)  # owner, contact, bot
+    text = Column(Text)
+
+    tokens_input = Column(Integer)
+    tokens_output = Column(Integer)
+    llm_model = Column(String(100))
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    session = relationship("ChatSession", back_populates="messages")
+    contact = relationship("Contact", back_populates="messages")
+
+
+class DirectMessage(Base):
+    """Сообщения в прямом чате с ботом"""
+    __tablename__ = "direct_messages"
+
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(Integer, ForeignKey("direct_chats.id"), nullable=False)
+
+    sender_type = Column(String(20), nullable=False)  # user, bot
+    text = Column(Text)
+
+    tokens_input = Column(Integer)
+    tokens_output = Column(Integer)
+    llm_model = Column(String(100))
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    chat = relationship("DirectChat", back_populates="messages")
+
+
+class Prompt(Base):
+    __tablename__ = "prompts"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text)
+    system_prompt = Column(Text, nullable=False)
+    category = Column(String(50), default="business")  # business, direct, universal
+    is_custom = Column(Boolean, default=False)
+    is_active = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    users = relationship("User", back_populates="prompt")
+
+
+class BusinessConnectionLog(Base):
+    __tablename__ = "business_connection_logs"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    business_connection_id = Column(String(255))
+    action = Column(String(50))
+    details = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
