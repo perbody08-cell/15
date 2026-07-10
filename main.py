@@ -1,103 +1,348 @@
-from typing import List, Dict, Optional
-from database.models import User, Contact, Prompt, DirectChat
+import sys
+sys.path.insert(0, '/app')
+
+import logging
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, filters, ContextTypes, BusinessConnectionHandler
+)
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy import select
+
+from settings import settings
+from database.models import Base, Prompt
+from database.crud import get_or_create_user
+
+from handlers.business import handle_business_message, handle_business_connection
+from handlers.direct import handle_direct_message, direct_mode_info
+from handlers.settings import (
+    settings_menu, select_prompt_business, select_prompt_direct, prompt_selected,
+    custom_prompt_start, custom_prompt_received,
+    knowledge_menu, knowledge_edit_start, knowledge_received,
+    stats_callback
+)
+from handlers.contacts import contacts_menu, contact_detail, toggle_contact
+from handlers.admin import admin_panel, admin_stats
+
+from keyboards.inline import main_menu_keyboard, mode_selection_keyboard
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+ENTERING_CUSTOM_PROMPT, ENTERING_KNOWLEDGE = range(2)
 
 
-class PromptBuilder:
+async def init_db():
+    """Инициализация БД и дефолтных промптов"""
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
-    # === BUSINESS MODE ===
-    BUSINESS_BASE = """Ты — {owner_name}. Ты отвечаешь от имени этого человека в Telegram.
-НИКОГДА не упоминай, что ты ИИ, бот или ассистент. Ты — реальный человек.
+    async_session = async_sessionmaker(engine, expire_on_commit=False)
+    async with async_session() as session:
+        result = await session.execute(select(Prompt).where(Prompt.id == 1))
+        if not result.scalar_one_or_none():
+            default_prompts = [
+                # === BUSINESS PROMPTS ===
+                Prompt(
+                    id=1,
+                    name="🎭 Дружелюбный",
+                    description="Тёплый, неформальный стиль",
+                    system_prompt="Ты — дружелюбный и открытый человек. Отвечай тепло, используй эмодзи, задавай вопросы собеседнику. Тон: неформальный, как с хорошим знакомым.",
+                    category="business"
+                ),
+                Prompt(
+                    id=2,
+                    name="💼 Деловой",
+                    description="Кратко, по делу, профессионально",
+                    system_prompt="Ты — деловой человек. Отвечай кратко, по существу, без лишних эмодзи. Тон: профессиональный, вежливый, но не холодный.",
+                    category="business"
+                ),
+                Prompt(
+                    id=3,
+                    name="🏠 Семья",
+                    description="Тепло, забота, внимание к деталям",
+                    system_prompt="Ты — семейный человек. Отвечай с заботой, интересуйся делами собеседника, используй тёплые слова. Тон: ласковый, внимательный.",
+                    category="business"
+                ),
+                Prompt(
+                    id=4,
+                    name="😎 Саркастичный",
+                    description="С иронией, но без злобы",
+                    system_prompt="Ты — человек с чувством юмора. Отвечай с лёгкой иронией, остроумно, но не грубо. Любишь поддразнивать друзей. Тон: игривый, саркастичный.",
+                    category="business"
+                ),
+                Prompt(
+                    id=5,
+                    name="🤫 Лаконичный",
+                    description="Коротко, по делу, без воды",
+                    system_prompt="Ты — лаконичный человек. Отвечай максимально коротко, 1-2 слова или предложение. Без эмодзи, без лишних слов. Тон: сдержанный.",
+                    category="business"
+                ),
+                # === DIRECT PROMPTS ===
+                Prompt(
+                    id=6,
+                    name="🤖 Универсальный ассистент",
+                    description="Полезный, дружелюбный AI",
+                    system_prompt="Ты — умный и дружелюбный AI-ассистент. Помогай с любыми вопросами, давай развёрнутые ответы, будь терпеливым. Тон: профессиональный, но тёплый.",
+                    category="direct"
+                ),
+                Prompt(
+                    id=7,
+                    name="🧙 Мудрый наставник",
+                    description="Философский, глубокий подход",
+                    system_prompt="Ты — мудрый наставник. Давай глубокие, осмысленные ответы. Используй метафоры, примеры из жизни. Тон: спокойный, философский, вдохновляющий.",
+                    category="direct"
+                ),
+                Prompt(
+                    id=8,
+                    name="⚡ Быстрый помощник",
+                    description="Кратко, по делу, без воды",
+                    system_prompt="Ты — эффективный помощник. Отвечай кратко и по существу. Без лишних слов, только факты и действия. Тон: деловой, энергичный.",
+                    category="direct"
+                ),
+                Prompt(
+                    id=9,
+                    name="🎨 Творческий собеседник",
+                    description="Воображение, креатив, нестандартные идеи",
+                    system_prompt="Ты — творческий собеседник. Предлагай нестандартные идеи, используй образные сравнения, вдохновляй на новое. Тон: игривый, креативный, энтузиаст.",
+                    category="direct"
+                ),
+                Prompt(
+                    id=10,
+                    name="🤝 Друг и собеседник",
+                    description="Неформально, с эмпатией, как друг",
+                    system_prompt="Ты — хороший друг. Общайся неформально, с эмпатией, поддерживай в трудную минуту. Используй сленг, шутки, эмодзи. Тон: тёплый, искренний.",
+                    category="direct"
+                ),
+            ]
+            for p in default_prompts:
+                session.add(p)
+            await session.commit()
 
-=== ТВОЙ СТИЛЬ ===
-{style_prompt}
+    return engine
 
-=== О ТЕБЕ ===
-{global_knowledge}
 
-=== О СОБЕСЕДНИКЕ ===
-Имя: {contact_name}
-Отношения: {relationship}
-{contact_notes}
+async def post_init(application: Application):
+    """Инициализация после старта бота"""
+    engine = await init_db()
+    application.bot_data["engine"] = engine
+    application.bot_data["db_session_factory"] = async_sessionmaker(engine, expire_on_commit=False)
+    logger.info("✅ База данных инициализирована")
 
-=== ПРАВИЛА ===
-- Отвечай естественно, как реальный человек
-- Используй тон и стиль, описанный выше
-- Не выдумывай факты, которых нет в контексте
-- Если не знаешь что ответить — ответь нейтрально, но естественно
-- Длина ответа: 1-3 предложения (как в обычном чате)
-"""
 
-    # === DIRECT MODE ===
-    DIRECT_BASE = """Ты — AI-ассистент пользователя в Telegram.
+async def get_db_session(context: ContextTypes.DEFAULT_TYPE) -> AsyncSession:
+    """Получение сессии БД"""
+    factory = context.bot_data["db_session_factory"]
+    return factory()
 
-=== ТВОЯ РОЛЬ ===
-{persona_description}
 
-=== СТИЛЬ ОБЩЕНИЯ ===
-{style_prompt}
+# ========== COMMANDS ==========
 
-=== О ПОЛЬЗОВАТЕЛЕ ===
-{user_knowledge}
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start"""
+    session = await get_db_session(context)
 
-=== ПРАВИЛА ===
-- Общайся естественно, дружелюбно
-- Помогай с вопросами, советами, разговорами
-- Не притворяйся человеком — ты AI, и это нормально
-- Будь честным о своих возможностях
-- Если не знаешь — скажи честно
-"""
+    user = await get_or_create_user(
+        session,
+        telegram_id=update.effective_user.id,
+        username=update.effective_user.username,
+        first_name=update.effective_user.first_name,
+        last_name=update.effective_user.last_name
+    )
 
-    @staticmethod
-    def build_business_prompt(user: User, contact: Optional[Contact] = None, 
-                              prompt: Optional[Prompt] = None) -> str:
-        style_prompt = user.custom_prompt or (prompt.system_prompt if prompt else "Отвечай естественно и дружелюбно.")
+    text = (
+        f"👋 Привет, {user.first_name or 'друг'}!\n\n"
+        "Я — AI-бот с двумя режимами работы:\n\n"
+        "💼 **Business Mode**\n"
+        "Подключи меня к Telegram Business — и я буду отвечать на сообщения от твоего имени в личных чатах.\n\n"
+        "🤖 **Direct Mode**\n"
+        "Просто общайся со мной напрямую как с AI-ассистентом. Задавай вопросы, проси помощь, обсуждай идеи.\n\n"
+        "⚙️ Настрой стиль, базу знаний и другие параметры в меню.\n"
+        "⚠️ Сейчас работаю в тестовом режиме (заглушка LLM)."
+    )
 
-        knowledge = user.global_knowledge or {}
-        knowledge_str = "\n".join([f"- {k}: {v}" for k, v in knowledge.items()]) or "Нет дополнительной информации."
+    await update.message.reply_text(text, reply_markup=main_menu_keyboard())
 
-        contact_name = contact.first_name or contact.username or "Собеседник" if contact else "Собеседник"
-        relationship = contact.relationship_type or "неизвестно" if contact else "неизвестно"
-        notes = f"Заметки: {contact.notes}" if contact and contact.notes else ""
 
-        if contact and contact.extracted_style:
-            style_data = contact.extracted_style
-            style_notes = f"\nИзвлечённый стиль общения: {style_data.get('tone', 'неизвестно')}"
-        else:
-            style_notes = ""
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /help"""
+    text = (
+        "📖 **Инструкция**\n\n"
+        "**Business Mode:**\n"
+        "1. Перейди в Настройки → Telegram Business → Автоматизация чатов\n"
+        "2. Введи @username бота\n"
+        "3. Выбери, к каким чатам бот будет иметь доступ\n"
+        "4. Настрой стиль и базу знаний в этом боте\n\n"
+        "**Direct Mode:**\n"
+        "Просто пиши мне сообщения — я отвечу как AI-ассистент.\n\n"
+        "**Команды:**\n"
+        "/start — главное меню\n"
+        "/help — эта инструкция\n"
+        "/settings — настройки\n"
+        "/admin — админ-панель (только для админов)\n\n"
+        "**Настройки:**\n"
+        "• Стиль ответов — выбери или создай свой промпт\n"
+        "• База знаний — расскажи о себе для персонализации\n"
+        "• Контакты — управляй, для кого бот отвечает (Business)\n"
+        "• LLM — выбери модель (позже)"
+    )
 
-        owner_name = user.first_name or "Пользователь"
+    await update.message.reply_text(text)
 
-        return PromptBuilder.BUSINESS_BASE.format(
-            owner_name=owner_name,
-            style_prompt=style_prompt + style_notes,
-            global_knowledge=knowledge_str,
-            contact_name=contact_name,
-            relationship=relationship,
-            contact_notes=notes
-        )
 
-    @staticmethod
-    def build_direct_prompt(user: User, chat: DirectChat, prompt: Optional[Prompt] = None) -> str:
-        style_prompt = chat.system_prompt or user.custom_prompt or (prompt.system_prompt if prompt else "Дружелюбный, полезный ассистент.")
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /settings"""
+    await settings_menu(update, context)
 
-        persona = chat.persona_description or "Универсальный AI-ассистент"
 
-        knowledge = user.global_knowledge or {}
-        knowledge_str = "\n".join([f"- {k}: {v}" for k, v in knowledge.items()]) or "Нет информации о пользователе."
+# ========== CALLBACK HANDLERS ==========
 
-        return PromptBuilder.DIRECT_BASE.format(
-            persona_description=persona,
-            style_prompt=style_prompt,
-            user_knowledge=knowledge_str
-        )
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главное меню"""
+    query = update.callback_query
+    await query.answer()
 
-    @staticmethod
-    def build_messages(history: List[Dict], new_message: str) -> List[Dict]:
-        messages = []
+    text = "🏠 Главное меню\n\nВыбери режим или перейди к настройкам:"
 
-        for msg in history:
-            role = "assistant" if msg["sender_type"] in ["owner", "bot"] else "user"
-            messages.append({"role": role, "content": msg["text"]})
+    await query.edit_message_text(text, reply_markup=main_menu_keyboard())
 
-        messages.append({"role": "user", "content": new_message})
-        return messages
+
+async def business_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Информация о Business Mode"""
+    query = update.callback_query
+    await query.answer()
+
+    text = (
+        "💼 **Business Mode**\n\n"
+        "Бот отвечает на сообщения **от твоего имени** в личных чатах через Telegram Business.\n\n"
+        "**Как подключить:**\n"
+        "1. Нужен Telegram Business (платная подписка)\n"
+        "2. Настройки → Автоматизация чатов → Добавить бота\n"
+        "3. Введи @username этого бота\n"
+        "4. Выбери чаты, к которым бот будет иметь доступ\n\n"
+        "**Что умеет:**\n"
+        "• Отвечать в твоём стиле (настраивается)\n"
+        "• Использовать базу знаний о тебе\n"
+        "• Учитывать контекст переписки\n"
+        "• Работать с разными контактами по-разному\n\n"
+        "**Безопасность:**\n"
+        "Ты сам решаешь, к каким чатам бот имеет доступ. Можно отключить в любой момент."
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ Настройки Business", callback_data="settings")],
+        [InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")]
+    ])
+
+    await query.edit_message_text(text, reply_markup=keyboard)
+
+
+async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор режима"""
+    query = update.callback_query
+    await query.answer()
+
+    text = "🎯 **Выбор режима**\n\nКак ты хочешь использовать бота?"
+
+    await query.edit_message_text(text, reply_markup=mode_selection_keyboard())
+
+
+# ========== ERROR HANDLER ==========
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Ошибка: {context.error}", exc_info=True)
+    if update and update.effective_message:
+        await update.effective_message.reply_text("⚠️ Произошла ошибка. Попробуй позже.")
+
+
+# ========== MAIN ==========
+
+def main():
+    application = Application.builder().token(settings.BOT_TOKEN).post_init(post_init).build()
+
+    # === Conversation Handlers ===
+    custom_prompt_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(custom_prompt_start, pattern="^custom_prompt$")],
+        states={
+            ENTERING_CUSTOM_PROMPT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, custom_prompt_received)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Отменено"))],
+    )
+
+    knowledge_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(knowledge_edit_start, pattern="^knowledge_edit$")],
+        states={
+            ENTERING_KNOWLEDGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, knowledge_received)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u, c: u.message.reply_text("Отменено"))],
+    )
+
+    # === Commands ===
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("admin", admin_panel))
+
+    # === Conversations ===
+    application.add_handler(custom_prompt_conv)
+    application.add_handler(knowledge_conv)
+
+    # === Callback Queries ===
+    application.add_handler(CallbackQueryHandler(main_menu_callback, pattern="^main_menu$"))
+    application.add_handler(CallbackQueryHandler(business_info_callback, pattern="^business_info$"))
+    application.add_handler(CallbackQueryHandler(mode_selection_callback, pattern="^mode_select$"))
+
+    # Settings
+    application.add_handler(CallbackQueryHandler(settings_menu, pattern="^settings$"))
+    application.add_handler(CallbackQueryHandler(select_prompt_business, pattern="^select_prompt_business$"))
+    application.add_handler(CallbackQueryHandler(select_prompt_direct, pattern="^select_prompt_direct$"))
+    application.add_handler(CallbackQueryHandler(prompt_selected, pattern=r"^prompt_(business|direct)_"))
+    application.add_handler(CallbackQueryHandler(knowledge_menu, pattern="^knowledge$"))
+    application.add_handler(CallbackQueryHandler(stats_callback, pattern="^stats$"))
+
+    # Contacts
+    application.add_handler(CallbackQueryHandler(contacts_menu, pattern="^contacts$"))
+    application.add_handler(CallbackQueryHandler(contact_detail, pattern=r"^contact_\d+$"))
+    application.add_handler(CallbackQueryHandler(toggle_contact, pattern=r"^toggle_contact_\d+$"))
+
+    # Direct Mode
+    application.add_handler(CallbackQueryHandler(direct_mode_info, pattern="^direct_mode$"))
+    application.add_handler(CallbackQueryHandler(direct_mode_info, pattern="^direct_mode_info$"))
+
+    # Admin
+    application.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
+
+    # === Business Connection ===
+    if settings.ENABLE_BUSINESS_MODE:
+        application.add_handler(BusinessConnectionHandler(handle_business_connection))
+        application.add_handler(MessageHandler(
+            filters.UpdateType.BUSINESS_MESSAGE,
+            handle_business_message
+        ))
+
+    # === Direct Mode (обычные сообщения в личке) ===
+    if settings.ENABLE_DIRECT_MODE:
+        application.add_handler(MessageHandler(
+            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            handle_direct_message
+        ))
+
+    # === Errors ===
+    application.add_error_handler(error_handler)
+
+    logger.info("🚀 Бот запущен!")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
