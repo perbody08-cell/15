@@ -1,267 +1,76 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes, ConversationHandler
+from telegram import Update
+from telegram.ext import ContextTypes
 from sqlalchemy.ext.asyncio import AsyncSession
-from database.crud import get_prompts, update_user_prompt, update_user_knowledge, get_user_stats, get_or_create_user
-from database.models import User
-
-ENTERING_CUSTOM_PROMPT, ENTERING_KNOWLEDGE = range(2)
-
-
-async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query:
-        await query.answer()
-    from keyboards.inline import settings_menu_keyboard
-    text = (
-        "⚙️ Настройки
-
-"
-        "Здесь вы можете настроить оба режима работы бота:
-
-"
-        "💼 Business Mode — как бот отвечает от вашего имени
-"
-        "🤖 Direct Mode — как бот общается с вами напрямую"
-    )
-    if query:
-        await query.edit_message_text(text, reply_markup=settings_menu_keyboard())
-    else:
-        await update.message.reply_text(text, reply_markup=settings_menu_keyboard())
+from database.crud import get_user_by_business_conn, get_or_create_contact, get_or_create_chat_session, get_chat_history, add_message, log_business_connection
+from services.llm import get_llm
+from services.prompt_builder import PromptBuilder
+from settings import settings
 
 
-async def select_prompt_business(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.business_message:
+        return
+    if not settings.ENABLE_BUSINESS_MODE:
+        return
+    business_msg = update.business_message
+    business_conn_id = business_msg.business_connection_id
     factory = context.bot_data["db_session_factory"]
     session: AsyncSession = factory()
     try:
-        prompts = await get_prompts(session, category="business")
-        keyboard = []
-        for prompt in prompts:
-            keyboard.append([InlineKeyboardButton(f"{prompt.name}", callback_data=f"prompt_business_{prompt.id}")])
-        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings")])
-        await query.edit_message_text(
-            "🎭 Выберите стиль для Business Mode:
-
-"
-            "Это определит, как бот будет отвечать от вашего имени в личных чатах.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    finally:
-        await session.close()
-
-
-async def select_prompt_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    factory = context.bot_data["db_session_factory"]
-    session: AsyncSession = factory()
-    try:
-        prompts = await get_prompts(session, category="direct")
-        keyboard = []
-        for prompt in prompts:
-            keyboard.append([InlineKeyboardButton(f"{prompt.name}", callback_data=f"prompt_direct_{prompt.id}")])
-        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings")])
-        await query.edit_message_text(
-            "🎭 Выберите стиль для Direct Mode:
-
-"
-            "Это определит, как я буду общаться с вами напрямую.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    finally:
-        await session.close()
-
-
-async def prompt_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data.split("_")
-    mode = data[1]
-    prompt_id = int(data[2])
-    factory = context.bot_data["db_session_factory"]
-    session: AsyncSession = factory()
-    try:
-        user = await get_or_create_user(session, telegram_id=update.effective_user.id)
-        from database.crud import get_prompt_by_id
-        prompt = await get_prompt_by_id(session, prompt_id)
-        await update_user_prompt(session, user.id, prompt_id)
-        mode_text = "Business Mode" if mode == "business" else "Direct Mode"
-        await query.edit_message_text(
-            f"✅ Стиль «{prompt.name}» выбран для {mode_text}!
-
-"
-            f"Описание: {prompt.description or 'Нет описания'}
-
-"
-            f"Промпт: {prompt.system_prompt[:200]}...",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="settings")]])
-        )
-    finally:
-        await session.close()
-
-
-async def custom_prompt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "✏️ Напишите свой промпт
-
-"
-        "Опишите, как бот должен отвечать.
-
-"
-        "💼 Для Business Mode:
-"
-        "«Отвечай кратко, используй сленг типа 'крч', 'типа'. "
-        "Любишь эмодзи 😎. С друзьями — неформально.»
-
-"
-        "🤖 Для Direct Mode:
-"
-        "«Общайся как мудрый наставник, давай развёрнутые "
-        "советы, используй примеры из жизни.»
-
-"
-        "Отправьте текст или /cancel для отмены."
-    )
-    return ENTERING_CUSTOM_PROMPT
-
-
-async def custom_prompt_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    factory = context.bot_data["db_session_factory"]
-    session: AsyncSession = factory()
-    try:
-        user = await get_or_create_user(session, telegram_id=update.effective_user.id)
-        user.custom_prompt = update.message.text
+        user = await get_user_by_business_conn(session, business_conn_id)
+        if not user:
+            return
+        contact_user = business_msg.from_user
+        contact = await get_or_create_contact(session, owner_id=user.id, telegram_user_id=contact_user.id, username=contact_user.username, first_name=contact_user.first_name, last_name=contact_user.last_name)
+        if not contact.is_active:
+            return
+        chat_session = await get_or_create_chat_session(session, owner_id=user.id, chat_id=business_msg.chat.id, contact_id=contact.id, session_type="business")
+        await add_message(session, session_id=chat_session.id, sender_type="contact", text=business_msg.text or "", contact_id=contact.id)
+        history = await get_chat_history(session, chat_session.id, limit=settings.MAX_CONTEXT_MESSAGES)
+        history_dicts = [{"sender_type": h.sender_type, "text": h.text} for h in history]
+        system_prompt = PromptBuilder.build_business_prompt(user=user, contact=contact, prompt=user.prompt)
+        messages = PromptBuilder.build_messages(history_dicts, business_msg.text or "")
+        llm = get_llm(user.llm_provider, user.llm_api_key)
+        try:
+            response_text = await llm.generate(system_prompt, messages, mode="business", user_settings={"user_id": user.id, "contact_id": contact.id})
+            await context.bot.send_message(chat_id=business_msg.chat.id, text=response_text, business_connection_id=business_conn_id)
+            await add_message(session, session_id=chat_session.id, sender_type="bot", text=response_text, contact_id=contact.id, llm_model=user.llm_provider)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Business LLM Error: {e}", exc_info=True)
+        from datetime import datetime
+        chat_session.last_message_at = datetime.utcnow()
         await session.commit()
-        await update.message.reply_text(
-            f"✅ Промпт сохранён!
-
-Текст: {update.message.text[:200]}...",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В настройки", callback_data="settings")]])
-        )
-    finally:
-        await session.close()
-    return ConversationHandler.END
-
-
-async def knowledge_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    factory = context.bot_data["db_session_factory"]
-    session: AsyncSession = factory()
-    try:
-        user = await get_or_create_user(session, telegram_id=update.effective_user.id)
-        knowledge = user.global_knowledge or {}
-        knowledge_text = "
-".join([f"• {k}: {v}" for k, v in knowledge.items()]) or "Пока нет записей."
-        keyboard = [
-            [InlineKeyboardButton("➕ Добавить/изменить", callback_data="knowledge_edit")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="settings")]
-        ]
-        await query.edit_message_text(
-            f"🧠 База знаний
-
-"
-            f"Эта информация используется в обоих режимах:
-
-"
-            f"{knowledge_text}
-
-"
-            f"💼 Business: помогает боту отвечать правдоподобно от вашего имени
-"
-            f"🤖 Direct: помогает мне лучше понимать ваш контекст",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
     finally:
         await session.close()
 
 
-async def knowledge_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "📝 Отправьте информацию о себе
-
-"
-        "Формат: Ключ - Значение (каждая строка — новый пункт)
-
-"
-        "Пример:
-"
-        "Работа - Программист в Яндексе
-"
-        "Город - Москва
-"
-        "Хобби - Играю в футбол по выходным
-"
-        "Семья - Женат, двое детей
-"
-        "Возраст - 28 лет
-"
-        "Интересы - AI, путешествия, кулинария
-
-"
-        "Отправьте текст или /cancel"
-    )
-    return ENTERING_KNOWLEDGE
-
-
-async def knowledge_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.business_connection:
+        return
+    conn = update.business_connection
     factory = context.bot_data["db_session_factory"]
     session: AsyncSession = factory()
     try:
-        user = await get_or_create_user(session, telegram_id=update.effective_user.id)
-        knowledge = {}
-        for line in update.message.text.split("
-"):
-            if " - " in line:
-                key, value = line.split(" - ", 1)
-                knowledge[key.strip()] = value.strip()
-        await update_user_knowledge(session, user.id, knowledge)
-        await update.message.reply_text(
-            f"✅ База знаний обновлена! ({len(knowledge)} пунктов)",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В настройки", callback_data="settings")]])
-        )
-    finally:
-        await session.close()
-    return ConversationHandler.END
+        from database.crud import get_or_create_user, update_business_connection
+        user = await get_or_create_user(session, telegram_id=conn.user_chat_id, first_name=conn.user.first_name if conn.user else None)
+        if conn.is_enabled:
+            await update_business_connection(session, user.id, conn.id)
+            await log_business_connection(session, user.id, conn.id, "connected", {"can_reply": conn.can_reply, "user_chat_id": conn.user_chat_id})
+            await context.bot.send_message(chat_id=conn.user_chat_id, text="✅ Business-аккаунт подключен!
 
+Бот теперь будет отвечать на сообщения от вашего имени в личных чатах.
 
-async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    factory = context.bot_data["db_session_factory"]
-    session: AsyncSession = factory()
-    try:
-        user = await get_or_create_user(session, telegram_id=update.effective_user.id)
-        stats = await get_user_stats(session, user.id)
-        await query.edit_message_text(
-            f"📊 Статистика
+📋 Что настроить:
+• Стиль ответов — как бот будет писать от вашего имени
+• База знаний — информация о вас для правдоподобных ответов
+• Контакты — для кого включить/выключить автоответ
 
-"
-            f"💼 Business Mode:
-"
-            f"  Контактов: {stats['contacts']}
-"
-            f"  Сессий: {stats['sessions']}
-"
-            f"  Сообщений: {stats['messages']}
-"
-            f"  Подключен: {'✅' if user.is_business_connected else '❌'}
-
-"
-            f"🤖 Direct Mode:
-"
-            f"  Сообщений: {stats['direct_messages']}
-"
-            f"  Включён: {'✅' if user.direct_mode_enabled else '❌'}
-
-"
-            f"⚙️ LLM: {user.llm_provider}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="settings")]])
-        )
+⚠️ Сейчас работает в тестовом режиме (заглушка LLM).")
+        else:
+            await log_business_connection(session, user.id, conn.id, "disconnected")
+            user.is_business_connected = False
+            await session.commit()
+            await context.bot.send_message(chat_id=conn.user_chat_id, text="❌ Business-аккаунт отключен. Бот больше не отвечает за вас.")
     finally:
         await session.close()

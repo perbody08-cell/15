@@ -1,1 +1,1 @@
-web: cd /app && python main.py
+worker: PYTHONPATH=/app python main.py

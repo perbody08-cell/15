@@ -1,6 +1,8 @@
-Deploy to Railway:
-1. Create new Railway project.
-2. Choose "Upload ZIP".
-3. Upload this ZIP file (do not extract first).
-4. Add environment variables: BOT_TOKEN, DATABASE_URL, ADMIN_IDS.
-5. Deploy.
+python-telegram-bot[job-queue]>=21.0
+sqlalchemy>=2.0
+asyncpg>=0.29
+alembic>=1.13
+python-dotenv>=1.0
+pydantic>=2.5
+pydantic-settings>=2.1
+aiohttp>=3.9

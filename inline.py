@@ -1,104 +1,82 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import ContextTypes
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
-from database.crud import get_or_create_user
-from database.models import Contact
+from database.crud import get_or_create_user, get_or_create_direct_chat, get_direct_chat_history, add_direct_message, update_direct_chat
+from services.llm import get_llm
+from services.prompt_builder import PromptBuilder
+from settings import settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-async def contacts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def handle_direct_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not settings.ENABLE_DIRECT_MODE:
+        return
+    if update.message and update.message.text and update.message.text.startswith("/"):
+        return
+    if update.business_message:
+        return
+    if update.effective_chat.type != "private":
+        return
     factory = context.bot_data["db_session_factory"]
     session: AsyncSession = factory()
     try:
-        user = await get_or_create_user(session, telegram_id=update.effective_user.id)
-        if not user.is_business_connected:
-            await query.edit_message_text(
-                "💼 Business Mode не подключён.
-
-"
-                "Подключите его в настройках Telegram Business, чтобы управлять контактами.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="settings")]])
-            )
+        user = await get_or_create_user(session, telegram_id=update.effective_user.id, username=update.effective_user.username, first_name=update.effective_user.first_name, last_name=update.effective_user.last_name)
+        if not user.direct_mode_enabled:
             return
-        result = await session.execute(select(Contact).where(Contact.owner_id == user.id).order_by(Contact.created_at.desc()).limit(20))
-        contacts = result.scalars().all()
-        if not contacts:
-            text = "👥 У вас пока нет контактов.
-
-Контакты появятся автоматически, когда кто-то напишет вам."
-            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="settings")]]
-        else:
-            text = "👥 Ваши контакты (Business Mode):
-
-"
-            keyboard = []
-            for c in contacts:
-                status = "🟢" if c.is_active else "🔴"
-                name = c.first_name or c.username or f"ID:{c.telegram_user_id}"
-                text += f"{status} {name} ({c.relationship_type})
-"
-                keyboard.append([InlineKeyboardButton(f"{status} {name}", callback_data=f"contact_{c.id}")])
-            keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="settings")])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        chat = await get_or_create_direct_chat(session, user.id)
+        await add_direct_message(session, chat_id=chat.id, sender_type="user", text=update.message.text or "")
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        history = await get_direct_chat_history(session, chat.id, limit=settings.MAX_CONTEXT_MESSAGES)
+        history_dicts = [{"sender_type": h.sender_type, "text": h.text} for h in history]
+        system_prompt = PromptBuilder.build_direct_prompt(user=user, chat=chat, prompt=user.prompt)
+        messages = PromptBuilder.build_messages(history_dicts, update.message.text or "")
+        llm = get_llm(user.llm_provider, user.llm_api_key)
+        try:
+            response_text = await llm.generate(system_prompt, messages, mode="direct", user_settings={"user_id": user.id, "chat_id": chat.id})
+            await update.message.reply_text(response_text)
+            await add_direct_message(session, chat_id=chat.id, sender_type="bot", text=response_text, llm_model=user.llm_provider)
+        except Exception as e:
+            logger.error(f"Direct LLM Error: {e}", exc_info=True)
+            await update.message.reply_text("⚠️ Произошла ошибка при генерации ответа. Попробуйте позже.")
     finally:
         await session.close()
 
 
-async def contact_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def direct_mode_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    contact_id = int(query.data.split("_")[1])
-    factory = context.bot_data["db_session_factory"]
-    session: AsyncSession = factory()
-    try:
-        user = await get_or_create_user(session, telegram_id=update.effective_user.id)
-        result = await session.execute(select(Contact).where(and_(Contact.id == contact_id, Contact.owner_id == user.id)))
-        contact = result.scalar_one_or_none()
-        if not contact:
-            await query.edit_message_text("Контакт не найден или недостаточно прав.")
-            return
-        name = contact.first_name or contact.username or f"ID:{contact.telegram_user_id}"
-        text = (
-            f"👤 {name}
+    text = (
+        "🤖 Direct Mode — общение с ботом
 
 "
-            f"Отношения: {contact.relationship_type}
-"
-            f"Статус: {'🟢 Бот отвечает' if contact.is_active else '🔴 Бот отключён'}
-"
-            f"Заметки: {contact.notes or 'Нет'}
-"
-            f"Извлечённый стиль: {contact.extracted_style or 'Не анализировался'}"
-        )
-        keyboard = [
-            [InlineKeyboardButton("🔴 Отключить бота" if contact.is_active else "🟢 Включить бота", callback_data=f"toggle_contact_{contact.id}")],
-            [InlineKeyboardButton("🏷️ Тип отношений", callback_data=f"rel_contact_{contact.id}")],
-            [InlineKeyboardButton("📝 Заметки", callback_data=f"notes_contact_{contact.id}")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="contacts")]
-        ]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    finally:
-        await session.close()
+        "В этом режиме вы просто общаетесь со мной как с AI-ассистентом.
 
+"
+        "💡 Возможности:
+"
+        "• Задавайте любые вопросы
+"
+        "• Просите помочь с задачами
+"
+        "• Обсуждайте идеи
+"
+        "• Практикуйте языки
+"
+        "• Получайте советы
 
-async def toggle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    contact_id = int(query.data.split("_")[2])
-    factory = context.bot_data["db_session_factory"]
-    session: AsyncSession = factory()
-    try:
-        user = await get_or_create_user(session, telegram_id=update.effective_user.id)
-        result = await session.execute(select(Contact).where(and_(Contact.id == contact_id, Contact.owner_id == user.id)))
-        contact = result.scalar_one_or_none()
-        if not contact:
-            await query.edit_message_text("Контакт не найден или недостаточно прав.")
-            return
-        from database.crud import update_contact
-        await update_contact(session, contact_id, is_active=not contact.is_active)
-    finally:
-        await session.close()
-    update.callback_query.data = f"contact_{contact_id}"
-    await contact_detail(update, context)
+"
+        "⚙️ Настройки:
+"
+        "• Выберите стиль общения
+"
+        "• Настройте свою персону
+"
+        "• Укажите интересы для персонализации
+
+"
+        "💼 Также доступен Business Mode — бот будет отвечать от вашего имени в личных чатах через Telegram Business."
+    )
+    from keyboards.inline import main_menu_keyboard
+    await query.edit_message_text(text, reply_markup=main_menu_keyboard())
