@@ -4,8 +4,6 @@ from settings import settings
 
 
 class MockLLM:
-    """Заглушка для тестирования"""
-
     BUSINESS_RESPONSES = [
         "Привет! Сейчас не могу ответить подробно, но скоро свяжусь.",
         "Понял тебя, давай обсудим это позже?",
@@ -26,10 +24,8 @@ class MockLLM:
         "Я здесь, чтобы помочь. Спроси что угодно!",
     ]
 
-    async def generate(self, system_prompt: str, messages: List[Dict], 
-                     mode: str = "business", user_settings: dict = None) -> str:
+    async def generate(self, system_prompt: str, messages: List[Dict], mode: str = "business", user_settings: dict = None) -> str:
         await __import__('asyncio').sleep(0.5)
-
         if mode == "direct":
             return random.choice(self.DIRECT_RESPONSES)
         return random.choice(self.BUSINESS_RESPONSES)
@@ -49,8 +45,7 @@ class AnthropicLLM:
         self.api_key = api_key
         self.model = model
 
-    async def generate(self, system_prompt: str, messages: List[Dict], 
-                       mode: str = "business", user_settings: dict = None) -> str:
+    async def generate(self, system_prompt: str, messages: List[Dict], mode: str = "business", user_settings: dict = None) -> str:
         raise NotImplementedError("Claude API не настроен")
 
     async def analyze_style(self, chat_history: List[str]) -> Dict:
@@ -62,8 +57,7 @@ class OpenAILLM:
         self.api_key = api_key
         self.model = model
 
-    async def generate(self, system_prompt: str, messages: List[Dict], 
-                       mode: str = "business", user_settings: dict = None) -> str:
+    async def generate(self, system_prompt: str, messages: List[Dict], mode: str = "business", user_settings: dict = None) -> str:
         raise NotImplementedError("OpenAI API не настроен")
 
     async def analyze_style(self, chat_history: List[str]) -> Dict:
@@ -75,8 +69,7 @@ class LocalLLM:
         self.base_url = base_url
         self.model = model
 
-    async def generate(self, system_prompt: str, messages: List[Dict], 
-                       mode: str = "business", user_settings: dict = None) -> str:
+    async def generate(self, system_prompt: str, messages: List[Dict], mode: str = "business", user_settings: dict = None) -> str:
         raise NotImplementedError("Локальный LLM не настроен")
 
     async def analyze_style(self, chat_history: List[str]) -> Dict:
@@ -85,7 +78,6 @@ class LocalLLM:
 
 def get_llm(provider: str = None, api_key: str = None):
     provider = provider or settings.LLM_PROVIDER
-
     if provider == "anthropic":
         return AnthropicLLM(api_key=api_key or settings.LLM_API_KEY, model=settings.LLM_MODEL)
     elif provider == "openai":
